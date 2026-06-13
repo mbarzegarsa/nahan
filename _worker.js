@@ -44,6 +44,7 @@ const SYSTEM_DEFAULTS = {
     enableOpt2: false,
     tgToken: "",
     tgChatId: "",
+    tgAdminId: "",
     cfAccountId: "",
     cfApiToken: "",
     isPaused: false,
@@ -167,12 +168,13 @@ function trackUsage(uuid, bytes, env, ctx) {
                             u.disabledAt = Date.now();
                             changedConfig = true;
                             ctx?.waitUntil(logActivity(env, "User Auto-Disabled", `User "${u.name}" (${u.id}) disabled: ${reason}`).catch(()=>{}));
-                            if (sysConfig.tgToken && sysConfig.tgChatId) {
+                            if (sysConfig.tgToken && (sysConfig.tgAdminId || sysConfig.tgChatId)) {
                                 const tgMsg = `⚠️ <b>User Auto-Disabled</b>\n\n👤 <b>User:</b> ${u.name}\n🆔 <b>ID:</b> <code>${u.id}</code>\n📝 <b>Reason:</b> ${reason}`;
+                                const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
                                 ctx?.waitUntil(fetch(`https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`, {
                                     method: 'POST',
                                     headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ chat_id: sysConfig.tgChatId, text: tgMsg, parse_mode: 'HTML' })
+                                    body: JSON.stringify({ chat_id: notifyChatId, text: tgMsg, parse_mode: 'HTML' })
                                 }).catch(()=>{}));
                             }
                         }
@@ -208,10 +210,14 @@ export default {
                 sync: `/${encodeURI(sysConfig.apiRoute)}/api/sync`,
                 tg: `/${encodeURI(sysConfig.apiRoute)}/tg`,
                 logs: `/${encodeURI(sysConfig.apiRoute)}/api/logs`,
+                users: `/${encodeURI(sysConfig.apiRoute)}/api/users`,
+                stats: `/${encodeURI(sysConfig.apiRoute)}/api/stats`,
             };
 
             const isSyncRoute = reqPath.endsWith('/api/sync');
-            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.logs || isSyncRoute;
+            const isUsersRoute = reqPath === routes.users || reqPath.endsWith('/api/users');
+            const isStatsRoute = reqPath === routes.stats || reqPath.endsWith('/api/stats');
+            const isAuthorizedRoute = reqPath === routes.data || reqPath === routes.dash || reqPath === routes.auth || reqPath === routes.sync || reqPath === routes.tg || reqPath === routes.logs || isSyncRoute || isUsersRoute || isStatsRoute;
 
             if (!isTelemetryStream && !isAuthorizedRoute) {
                 return serveMaintenancePage(request, url);
@@ -232,6 +238,12 @@ export default {
                 if (reqPath === routes.logs) {
                     if (request.method !== "POST" && request.method !== "GET") return new Response("405", { status: 405 });
                     return await handleLogs(request, env);
+                }
+                if (isUsersRoute) {
+                    return await handleUsersApi(request, env, ctx);
+                }
+                if (isStatsRoute) {
+                    return await handleStatsApi(request, env);
                 }
                 if (reqPath === routes.tg) {
                     if (request.method !== "POST") return new Response("405", { status: 405 });
@@ -702,7 +714,7 @@ async function fetchCloudflareUsage(accountId, apiToken) {
 }
 
 async function sendTelegramMessage(request, type) {
-    if (!sysConfig.tgToken || !sysConfig.tgChatId) return;
+    if (!sysConfig.tgToken || !(sysConfig.tgAdminId || sysConfig.tgChatId)) return;
 
     let usageStr = "نامشخص (0.00%)";
     if (sysConfig.cfAccountId && sysConfig.cfApiToken) {
@@ -743,12 +755,13 @@ async function sendTelegramMessage(request, type) {
     const panelUrl = `https://${domain}/${encodeURI(sysConfig.apiRoute)}/dash`;
 
     const tgUrl = `https://api.telegram.org/bot${sysConfig.tgToken}/sendMessage`;
+    const notifyChatId = sysConfig.tgAdminId || sysConfig.tgChatId;
     try {
         await fetch(tgUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                chat_id: sysConfig.tgChatId,
+                chat_id: notifyChatId,
                 text: text,
                 parse_mode: 'HTML',
                 reply_markup: {
@@ -792,6 +805,195 @@ async function handleLogs(request, env) {
         }
         return new Response("OK", { status: 200 });
     } catch (e) { return new Response(JSON.stringify({ success: false }), { status: 400 }); }
+}
+
+async function handleUsersApi(request, env, ctx) {
+    try {
+        const url = new URL(request.url);
+        const method = request.method;
+        const userId = url.searchParams.get("id");
+        const action = url.searchParams.get("action");
+
+        const authHeader = request.headers.get("Authorization") || "";
+        const authKey = authHeader.replace("Bearer ", "") || url.searchParams.get("key") || "";
+        let bodyKey = "";
+        if (method === "POST" || method === "PUT") {
+            try {
+                const body = await request.clone().json();
+                bodyKey = body.key || "";
+            } catch(e) {}
+        }
+        const isAuth = (authKey === sysConfig.masterKey) || (bodyKey === sysConfig.masterKey);
+        if (!isAuth) {
+            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "GET" && !userId) {
+            const q = url.searchParams.get("q") || "";
+            let users = sysConfig.users || [];
+            if (q) {
+                const ql = q.toLowerCase();
+                users = users.filter(u => u.name.toLowerCase().includes(ql) || u.id.toLowerCase().includes(ql) || (u.notes && u.notes.toLowerCase().includes(ql)));
+            }
+            const enriched = users.map(u => {
+                const idClean = u.id.replace(/-/g, '').toLowerCase();
+                const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
+                const usedBytes = Math.floor((sysU.reqs || 0) * (1073741824 / 6000));
+                const limitBytes = u.limitTotalReq ? Math.floor(u.limitTotalReq * (1073741824 / 6000)) : 0;
+                const isExpired = u.expiryMs && Date.now() > u.expiryMs;
+                let status = "active";
+                if (u.isPaused && u.disabledReason) status = "auto-disabled";
+                else if (u.isPaused) status = "paused";
+                else if (isExpired) status = "expired";
+                return { ...u, usage: { total: usedBytes, limit: limitBytes, daily: sysU.dReqs || 0, dailyLimit: u.limitDailyReq || 0 }, status };
+            });
+            return new Response(JSON.stringify({ success: true, users: enriched, total: enriched.length }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "GET" && userId) {
+            const u = (sysConfig.users || []).find(usr => usr.id === userId || usr.name.toLowerCase() === userId.toLowerCase());
+            if (!u) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+            const idClean = u.id.replace(/-/g, '').toLowerCase();
+            const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
+            const usedBytes = Math.floor((sysU.reqs || 0) * (1073741824 / 6000));
+            const limitBytes = u.limitTotalReq ? Math.floor(u.limitTotalReq * (1073741824 / 6000)) : 0;
+            const isExpired = u.expiryMs && Date.now() > u.expiryMs;
+            let status = "active";
+            if (u.isPaused && u.disabledReason) status = "auto-disabled";
+            else if (u.isPaused) status = "paused";
+            else if (isExpired) status = "expired";
+            const hostName = new URL(request.url).hostname;
+            const subUrl = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(u.name)}`;
+            return new Response(JSON.stringify({ success: true, user: { ...u, usage: { total: usedBytes, limit: limitBytes, daily: sysU.dReqs || 0, dailyLimit: u.limitDailyReq || 0 }, status, subscriptionUrl: subUrl } }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "POST" && !userId) {
+            const body = await request.json();
+            const { name, trafficLimit, expiryDays, notes, maxConfigs, proxyIp, userMode, userPorts } = body;
+            if (!name) return new Response(JSON.stringify({ success: false, error: "Name is required" }), { status: 400, headers: { "Content-Type": "application/json" } });
+            const newId = crypto.randomUUID();
+            const newUser = {
+                id: newId,
+                name: name,
+                limitTotalReq: trafficLimit ? Math.floor(parseFloat(trafficLimit) * 6000) : null,
+                limitDailyReq: body.dailyLimit ? Math.floor(parseFloat(body.dailyLimit) * 6000) : null,
+                expiryMs: expiryDays ? Date.now() + parseInt(expiryDays) * 86400000 : null,
+                notes: notes || "",
+                maxConfigs: maxConfigs ? parseInt(maxConfigs) : null,
+                proxyIp: proxyIp || null,
+                userMode: userMode || null,
+                userPorts: userPorts || null,
+                createdAt: Date.now()
+            };
+            if (!sysConfig.users) sysConfig.users = [];
+            sysConfig.users.push(newUser);
+            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            ctx?.waitUntil(logActivity(env, "User Created", `User "${name}" (${newId}) created via API`).catch(()=>{}));
+            const hostName = new URL(request.url).hostname;
+            const subUrl = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(name)}`;
+            return new Response(JSON.stringify({ success: true, user: newUser, subscriptionUrl: subUrl }), { status: 201, headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "PUT" && userId) {
+            const body = await request.json();
+            if (!sysConfig.users) return new Response(JSON.stringify({ success: false, error: "No users" }), { status: 400, headers: { "Content-Type": "application/json" } });
+            const u = sysConfig.users.find(usr => usr.id === userId);
+            if (!u) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+            if (body.name !== undefined) u.name = body.name;
+            if (body.trafficLimit !== undefined) u.limitTotalReq = body.trafficLimit ? Math.floor(parseFloat(body.trafficLimit) * 6000) : null;
+            if (body.dailyLimit !== undefined) u.limitDailyReq = body.dailyLimit ? Math.floor(parseFloat(body.dailyLimit) * 6000) : null;
+            if (body.expiryDays !== undefined) u.expiryMs = body.expiryDays ? Date.now() + parseInt(body.expiryDays) * 86400000 : null;
+            if (body.notes !== undefined) u.notes = body.notes;
+            if (body.maxConfigs !== undefined) u.maxConfigs = body.maxConfigs ? parseInt(body.maxConfigs) : null;
+            if (body.proxyIp !== undefined) u.proxyIp = body.proxyIp;
+            if (body.userMode !== undefined) u.userMode = body.userMode;
+            if (body.userPorts !== undefined) u.userPorts = body.userPorts;
+            if (body.status !== undefined) {
+                if (body.status === "active") { u.isPaused = false; u.disabledReason = null; u.disabledAt = null; }
+                else if (body.status === "paused") { u.isPaused = true; u.disabledReason = null; u.disabledAt = null; }
+            }
+            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            ctx?.waitUntil(logActivity(env, "User Updated", `User "${u.name}" (${userId}) updated via API`).catch(()=>{}));
+            return new Response(JSON.stringify({ success: true, user: u }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "DELETE" && userId) {
+            if (!sysConfig.users) return new Response(JSON.stringify({ success: false, error: "No users" }), { status: 400, headers: { "Content-Type": "application/json" } });
+            const idx = sysConfig.users.findIndex(usr => usr.id === userId);
+            if (idx === -1) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+            const deleted = sysConfig.users.splice(idx, 1)[0];
+            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            ctx?.waitUntil(logActivity(env, "User Deleted", `User "${deleted.name}" (${userId}) deleted via API`).catch(()=>{}));
+            return new Response(JSON.stringify({ success: true, deleted: deleted.id }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "POST" && userId && action === "toggle") {
+            if (!sysConfig.users) return new Response(JSON.stringify({ success: false, error: "No users" }), { status: 400, headers: { "Content-Type": "application/json" } });
+            const u = sysConfig.users.find(usr => usr.id === userId);
+            if (!u) return new Response(JSON.stringify({ success: false, error: "User not found" }), { status: 404, headers: { "Content-Type": "application/json" } });
+            u.isPaused = !u.isPaused;
+            if (!u.isPaused) { u.disabledReason = null; u.disabledAt = null; }
+            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+            ctx?.waitUntil(logActivity(env, "User Toggled", `User "${u.name}" (${userId}) ${u.isPaused ? 'paused' : 'resumed'} via API`).catch(()=>{}));
+            return new Response(JSON.stringify({ success: true, user: u }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        if (method === "POST" && userId && action === "reset") {
+            if (!sysUsageCache) sysUsageCache = { users: {} };
+            if (!sysUsageCache.users) sysUsageCache.users = {};
+            const uuidClean = userId.replace(/-/g, '').toLowerCase();
+            if (sysUsageCache.users[uuidClean]) {
+                sysUsageCache.users[uuidClean].reqs = 0;
+                sysUsageCache.users[uuidClean].dReqs = 0;
+            } else {
+                sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
+            }
+            await d1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
+            ctx?.waitUntil(logActivity(env, "Traffic Reset", `Traffic reset for user ${userId} via API`).catch(()=>{}));
+            return new Response(JSON.stringify({ success: true, message: "Traffic reset" }), { headers: { "Content-Type": "application/json" } });
+        }
+
+        return new Response(JSON.stringify({ success: false, error: "Invalid request" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    } catch (e) { return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } }); }
+}
+
+async function handleStatsApi(request, env) {
+    try {
+        const url = new URL(request.url);
+        const authHeader = request.headers.get("Authorization") || "";
+        const authKey = authHeader.replace("Bearer ", "") || url.searchParams.get("key") || "";
+        if (authKey !== sysConfig.masterKey) {
+            return new Response(JSON.stringify({ success: false, error: "Unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
+        }
+
+        const users = sysConfig.users || [];
+        const totalUsers = users.length;
+        const activeUsers = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
+        const pausedUsers = users.filter(u => u.isPaused).length;
+        const expiredUsers = users.filter(u => u.expiryMs && Date.now() > u.expiryMs).length;
+        const autoDisabledUsers = users.filter(u => u.isPaused && u.disabledReason).length;
+
+        let totalTrafficReqs = 0;
+        let dailyTrafficReqs = 0;
+        const todayDate = new Date().toISOString().split('T')[0];
+        users.forEach(u => {
+            const idClean = u.id.replace(/-/g, '').toLowerCase();
+            const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
+            totalTrafficReqs += (sysU.reqs || 0);
+            if (sysU.lastDay === todayDate) dailyTrafficReqs += (sysU.dReqs || 0);
+        });
+
+        const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
+
+        return new Response(JSON.stringify({
+            success: true,
+            stats: {
+                users: { total: totalUsers, active: activeUsers, paused: pausedUsers, expired: expiredUsers, autoDisabled: autoDisabledUsers },
+                traffic: { totalRequests: totalTrafficReqs, totalGB: (totalTrafficReqs / 6000).toFixed(2), dailyRequests: dailyTrafficReqs, dailyGB: (dailyTrafficReqs / 6000).toFixed(2) },
+                system: { uptimeSeconds: upSeconds, activeConnections, version: CURRENT_VERSION, isPaused: sysConfig.isPaused || false }
+            }
+        }), { headers: { "Content-Type": "application/json" } });
+    } catch (e) { return new Response(JSON.stringify({ success: false, error: e.message }), { status: 500, headers: { "Content-Type": "application/json" } }); }
 }
 
 async function handleAuth(request, hostName, ctx, env) {
@@ -937,7 +1139,25 @@ const botI18n = {
         msg_enter_limits: "Enter limits format:\n`[totalReqs] [dailyReqs] [days_limit]`\n(Use 0 for unlimited)\n\nExample:\n`10000 500 30`",
         msg_confirm_del: "⚠️ Are you sure you want to delete this subscriber?",
         msg_confirm_panic: "⚠️ Are you absolutely sure you want to trigger PANIC mode? This will randomize API routes and pause all connections!",
-        status_updated: "Status updated! 🔁"
+        status_updated: "Status updated! 🔁",
+        access_denied: "❌ Access Denied. You are not authorized to manage this panel.",
+        dashboard: "📊 Dashboard",
+        search: "🔍 Search User",
+        statistics: "📈 Statistics",
+        panel_info: "ℹ️ Panel Info",
+        disabled_users: "🚫 Disabled Users",
+        reset_traffic: "🔄 Reset Traffic",
+        extend_expiry: "📅 Extend Expiry",
+        notes: "📝 Notes",
+        device_limit: "📱 Device Limit",
+        msg_enter_search: "🔍 Send a username, UUID, or subscription to search:",
+        msg_enter_notes: "📝 Send notes for this user:",
+        msg_enter_extend_days: "📅 Enter number of days to extend expiration:",
+        msg_traffic_reset: "✅ Traffic has been reset successfully!",
+        msg_expiry_extended: "✅ Expiration extended by {days} days!",
+        msg_no_disabled: "No disabled users found.",
+        msg_enter_device_limit: "📱 Enter device limit (0 for unlimited):",
+        stats_title: "📈 Panel Statistics",
     },
     fa: {
         welcome: "🤖 **به ربات ترانزیت نهان خوش آمدید**\nجهت مدیریت سیستم نظارتی خود یکی از گزینه‌های زیر را انتخاب نمایید:",
@@ -978,7 +1198,25 @@ const botI18n = {
         msg_enter_limits: "فرمت ورودی محدودیت:\n`[کل] [روزانه] [مدت_روز]`\n(از 0 برای نامحدود استفاده کنید)\n\nمثال:\n`10000 500 30`",
         msg_confirm_del: "⚠️ آیا از حذف این مشترک اطمینان کامل دارید؟",
         msg_confirm_panic: "⚠️ آیا از فعال‌سازی وضعیت اضطراری اطمینان دارید؟ کل اتصالات متوقف و آدرس‌ها منقضی خواهند شد!",
-        status_updated: "وضعیت بروزرسانی شد! 🔁"
+        status_updated: "وضعیت بروزرسانی شد! 🔁",
+        access_denied: "❌ دسترسی غیرمجاز. شما اجازه مدیریت این پنل را ندارید.",
+        dashboard: "📊 داشبورد",
+        search: "🔍 جستجوی کاربر",
+        statistics: "📈 آمار",
+        panel_info: "ℹ️ اطلاعات پنل",
+        disabled_users: "🚫 کاربران غیرفعال",
+        reset_traffic: "🔄 بازنشانی ترافیک",
+        extend_expiry: "📅 تمدید انقضا",
+        notes: "📝 یادداشت‌ها",
+        device_limit: "📱 محدودیت دستگاه",
+        msg_enter_search: "🔍 نام کاربری، UUID یا لینک اشتراک را ارسال کنید:",
+        msg_enter_notes: "📝 یادداشت برای این کاربر را ارسال کنید:",
+        msg_enter_extend_days: "📅 تعداد روزهای تمدید را وارد کنید:",
+        msg_traffic_reset: "✅ ترافیک با موفقیت بازنشانی شد!",
+        msg_expiry_extended: "✅ انقضا به مدت {days} روز تمدید شد!",
+        msg_no_disabled: "هیچ کاربر غیرفعالی یافت نشد.",
+        msg_enter_device_limit: "📱 محدودیت دستگاه را وارد کنید (0 برای نامحدود):",
+        stats_title: "📈 آمار پنل",
     }
 };
 
@@ -986,16 +1224,31 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
     try {
         const update = await request.json();
         const tgApi = `https://api.telegram.org/bot${sysConfig.tgToken}`;
-        
+
+        const langCode = sysConfig.tgBotLang || "fa";
+        const t = (key) => botI18n[langCode]?.[key] || botI18n["en"]?.[key] || key;
+
+        const callerId = update.callback_query?.from?.id?.toString() || update.message?.from?.id?.toString();
+        const adminId = sysConfig.tgAdminId || sysConfig.tgChatId;
+        const isAuthorized = adminId && callerId === adminId.toString();
+
+        if (!isAuthorized && callerId) {
+            const chatId = update.callback_query?.message?.chat?.id || update.message?.chat?.id;
+            if (chatId) {
+                await fetch(`${tgApi}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ chat_id: chatId, text: t("access_denied") })
+                });
+            }
+            return new Response("OK", { status: 200 });
+        }
+
         let tgState = {};
         try {
             const storedState = await d1Get(env, "tg_bot_state");
             if (storedState) tgState = JSON.parse(storedState);
         } catch (e) { }
-
-        // Determine language code (default to Persian)
-        const langCode = sysConfig.tgBotLang || "fa";
-        const t = (key) => botI18n[langCode]?.[key] || botI18n["en"]?.[key] || key;
 
         // Custom sendOrEdit message helper
         const sendOrEdit = async (chatId, text, replyMarkup = null, messageId = null) => {
@@ -1030,24 +1283,35 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
         const getMainMenu = () => {
             const isPaused = sysConfig.isPaused || false;
             const statusEmoji = isPaused ? "🔴" : "🟢";
+            const users = sysConfig.users || [];
+            const activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
+            const disabledCount = users.filter(u => u.isPaused).length;
             const text = `${t("welcome")}\n\n` +
                          `━━━━━━━━━━━━━━━━\n` +
                          `⚡ **${t("status")}**: ${isPaused ? t("paused") : t("active")} ${statusEmoji}\n` +
-                         `👥 **${t("users")}**: ${sysConfig.users?.length || 0}\n` +
+                         `👥 **${t("users")}**: ${users.length} (${activeCount} active, ${disabledCount} paused)\n` +
                          `━━━━━━━━━━━━━━━━`;
             const panelUrl = `https://${hostName}/${encodeURI(sysConfig.apiRoute)}/dash`;
             const kb = {
                 inline_keyboard: [
                     [
+                        { text: `👥 ${t("users")}`, callback_data: "subs_list:0" },
+                        { text: `🔍 ${t("search")}`, callback_data: "sub_search_init" }
+                    ],
+                    [
+                        { text: `📊 ${t("dashboard")}`, callback_data: "sys_dashboard" },
+                        { text: `📈 ${t("statistics")}`, callback_data: "sys_stats" }
+                    ],
+                    [
+                        { text: `🚫 ${t("disabled_users")}`, callback_data: "subs_disabled:0" }
+                    ],
+                    [
                         { text: `🌐 ${langCode === 'fa' ? 'English 🇺🇸' : 'فارسی 🇮🇷'}`, callback_data: "sys_lang" },
                         { text: isPaused ? "▶️ Resume" : "⏸️ Pause", callback_data: "sys_toggle_status" }
                     ],
                     [
-                        { text: `👥 ${t("users")}`, callback_data: "subs_list:0" },
-                        { text: `📡 ${t("metrics")}`, callback_data: "sys_metrics" }
-                    ],
-                    [
-                        { text: `🔑 ${t("dash")}`, web_app: { url: panelUrl } }
+                        { text: `🔑 ${t("dash")}`, web_app: { url: panelUrl } },
+                        { text: `ℹ️ ${t("panel_info")}`, callback_data: "sys_panel_info" }
                     ],
                     [
                         { text: `🚨 ${t("panic")}`, callback_data: "sys_panic_init" }
@@ -1113,12 +1377,17 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             
             const limitTotalTxt = u.limitTotalReq ? `${u.limitTotalReq}` : t("unlimited");
             const limitDailyTxt = u.limitDailyReq ? `${u.limitDailyReq}` : t("unlimited");
+            const usedGB = (userReqs / 6000).toFixed(2);
+            const limitGB = u.limitTotalReq ? (u.limitTotalReq / 6000).toFixed(2) : t("unlimited");
             
             let expTxt = t("unlimited");
             let isExp = false;
+            let daysLeft = t("unlimited");
             if (u.expiryMs) {
                 const date = new Date(u.expiryMs);
                 expTxt = date.toLocaleDateString();
+                const remDays = Math.ceil((u.expiryMs - Date.now()) / 86400000);
+                daysLeft = remDays >= 0 ? `${remDays}` : '0';
                 if (Date.now() > u.expiryMs) {
                     expTxt += ` (${langCode === 'fa' ? 'منقضی شده 🔴' : 'Expired 🔴'})`;
                     isExp = true;
@@ -1128,15 +1397,20 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
             const statusEmoji = u.isPaused ? "⏸️" : (isExp ? "🔴" : "🟢");
             const statusText = u.isPaused ? t("paused") : (isExp ? (langCode==='fa'?'منقضی':'Expired') : t("active"));
             const subSync = `https://${hostName}/${sysConfig.apiRoute}?sub=${encodeURIComponent(u.name)}`;
+            const maxCfgTxt = u.maxConfigs || t("unlimited");
+            const notesTxt = u.notes || (langCode === 'fa' ? 'ندارد' : 'None');
             
             let text = `👤 **${t("sub_info")}**\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
             text += `📛 **${t("name")}**: ${u.name}\n`;
             text += `🆔 **UUID**: <code>${u.id}</code>\n`;
             text += `🚦 **Status**: ${statusEmoji} ${statusText}\n`;
-            text += `📊 **${t("total")}**: ${userReqs} / ${limitTotalTxt}\n`;
+            text += `📊 **${t("total")}**: ${usedGB} GB / ${limitGB} GB (${userReqs} reqs)\n`;
             text += `⏱ **${t("daily")}**: ${userDReqs} / ${limitDailyTxt}\n`;
             text += `📅 **${t("expiry")}**: ${expTxt}\n`;
+            text += `⏳ **${t("days")}**: ${daysLeft}\n`;
+            text += `📱 **${t("device_limit")}**: ${maxCfgTxt}\n`;
+            text += `📝 **${t("notes")}**: ${notesTxt}\n`;
             text += `━━━━━━━━━━━━━━━━\n`;
             text += `🔗 **Subscription Connection:**\n<code>${subSync}</code>`;
             
@@ -1149,6 +1423,14 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     [
                         { text: `✏️ ${t("btn_edit_name")}`, callback_data: `sub_edit_name_init:${u.id}` },
                         { text: `⚙️ ${t("btn_edit_limits")}`, callback_data: `sub_edit_limits_init:${u.id}` }
+                    ],
+                    [
+                        { text: `🔄 ${t("reset_traffic")}`, callback_data: `sub_reset_traffic:${u.id}` },
+                        { text: `📅 ${t("extend_expiry")}`, callback_data: `sub_extend_init:${u.id}` }
+                    ],
+                    [
+                        { text: `📝 ${t("notes")}`, callback_data: `sub_edit_notes_init:${u.id}` },
+                        { text: `📱 ${t("device_limit")}`, callback_data: `sub_edit_device_init:${u.id}` }
                     ],
                     [
                         { text: "🔙 Back to List", callback_data: "subs_list:0" }
@@ -1332,6 +1614,139 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                     const successText = `${t("msg_panic")}\n\n🔑 New Secret Path Randomized. All old sessions revoked.`;
                     const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
                     await sendOrEdit(chatId, successText, kb, messageId);
+                } else if (data === "sys_dashboard") {
+                    const users = sysConfig.users || [];
+                    const activeCount = users.filter(u => !u.isPaused && (!u.expiryMs || Date.now() <= u.expiryMs)).length;
+                    const disabledCount = users.filter(u => u.isPaused).length;
+                    const expiredCount = users.filter(u => u.expiryMs && Date.now() > u.expiryMs).length;
+                    const autoDisabledCount = users.filter(u => u.isPaused && u.disabledReason).length;
+                    const upSeconds = Math.floor((Date.now() - isolateStartTime) / 1000);
+                    const dh = Math.floor(upSeconds / 3600);
+                    const dm = Math.floor((upSeconds % 3600) / 60);
+                    let dashText = `📊 **${t("dashboard")}**\n`;
+                    dashText += `━━━━━━━━━━━━━━━━\n`;
+                    dashText += `👥 **Total Users**: ${users.length}\n`;
+                    dashText += `🟢 **Active**: ${activeCount}\n`;
+                    dashText += `⏸️ **Paused**: ${disabledCount}\n`;
+                    dashText += `🔴 **Expired**: ${expiredCount}\n`;
+                    dashText += `🚫 **Auto-Disabled**: ${autoDisabledCount}\n`;
+                    dashText += `⏱ **${t("uptime")}**: ${dh}h ${dm}m\n`;
+                    dashText += `🔌 **${t("streams")}**: ${activeConnections}\n`;
+                    dashText += `⚡ **System**: ${sysConfig.isPaused ? t("paused") : t("active")}\n`;
+                    dashText += `━━━━━━━━━━━━━━━━`;
+                    const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                    await sendOrEdit(chatId, dashText, kb, messageId);
+                } else if (data === "sys_stats") {
+                    const users = sysConfig.users || [];
+                    let totalReqs = 0;
+                    let dailyReqs = 0;
+                    const todayDate = new Date().toISOString().split('T')[0];
+                    users.forEach(u => {
+                        const idClean = u.id.replace(/-/g, '').toLowerCase();
+                        const sysU = sysUsageCache?.users?.[idClean] || { reqs: 0, dReqs: 0, lastDay: '' };
+                        totalReqs += (sysU.reqs || 0);
+                        if (sysU.lastDay === todayDate) dailyReqs += (sysU.dReqs || 0);
+                    });
+                    let statsText = `📈 **${t("stats_title")}**\n`;
+                    statsText += `━━━━━━━━━━━━━━━━\n`;
+                    statsText += `👥 **Total Users**: ${users.length}\n`;
+                    statsText += `📊 **Total Traffic**: ${(totalReqs / 6000).toFixed(2)} GB\n`;
+                    statsText += `📅 **Daily Traffic**: ${(dailyReqs / 6000).toFixed(2)} GB\n`;
+                    statsText += `━━━━━━━━━━━━━━━━`;
+                    const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                    await sendOrEdit(chatId, statsText, kb, messageId);
+                } else if (data === "sys_panel_info") {
+                    let infoText = `ℹ️ **${t("panel_info")}**\n`;
+                    infoText += `━━━━━━━━━━━━━━━━\n`;
+                    infoText += `🌐 **Host**: ${hostName}\n`;
+                    infoText += `🔑 **API Route**: \`${sysConfig.apiRoute}\`\n`;
+                    infoText += `📡 **Mode**: ${sysConfig.mode || 'alpha'}\n`;
+                    infoText += `🔒 **Ports**: ${sysConfig.socketPorts || '443'}\n`;
+                    infoText += `📱 **Version**: ${CURRENT_VERSION}\n`;
+                    infoText += `━━━━━━━━━━━━━━━━`;
+                    const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                    await sendOrEdit(chatId, infoText, kb, messageId);
+                } else if (data.startsWith("subs_disabled:")) {
+                    const users = sysConfig.users || [];
+                    const disabledUsers = users.filter(u => u.isPaused);
+                    if (disabledUsers.length === 0) {
+                        const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                        await sendOrEdit(chatId, `🚫 ${t("msg_no_disabled")}`, kb, messageId);
+                    } else {
+                        const page = parseInt(data.replace("subs_disabled:", "")) || 0;
+                        const itemsPerPage = 5;
+                        const start = page * itemsPerPage;
+                        const end = start + itemsPerPage;
+                        const pageUsers = disabledUsers.slice(start, end);
+                        let text = `🚫 **${t("disabled_users")}** (${disabledUsers.length})\n━━━━━━━━━━━━━━━━\n`;
+                        const inline_keyboard = [];
+                        pageUsers.forEach((u) => {
+                            const reason = u.disabledReason || (langCode === 'fa' ? 'غیرفعال شده' : 'Paused');
+                            text += `👤 **${u.name}**\n   ${reason}\n`;
+                            inline_keyboard.push([{ text: `▶️ ${u.name}`, callback_data: `sub_toggle:${u.id}` }]);
+                        });
+                        const navRow = [];
+                        if (page > 0) navRow.push({ text: `⬅️ ${t("btn_back")}`, callback_data: `subs_disabled:${page - 1}` });
+                        if (end < disabledUsers.length) navRow.push({ text: `${t("btn_next")} ➡️`, callback_data: `subs_disabled:${page + 1}` });
+                        if (navRow.length > 0) inline_keyboard.push(navRow);
+                        inline_keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+                        await sendOrEdit(chatId, text, { inline_keyboard }, messageId);
+                    }
+                } else if (data === "sub_search_init") {
+                    tgState[chatId] = { step: "sub_search" };
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    const text = `🔍 ${t("msg_enter_search")}`;
+                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: "main_menu" }]] };
+                    await sendOrEdit(chatId, text, kb, messageId);
+                } else if (data.startsWith("sub_reset_traffic:")) {
+                    const uuid = data.replace("sub_reset_traffic:", "");
+                    if (!sysUsageCache) sysUsageCache = { users: {} };
+                    if (!sysUsageCache.users) sysUsageCache.users = {};
+                    const uuidClean = uuid.replace(/-/g, '').toLowerCase();
+                    if (sysUsageCache.users[uuidClean]) {
+                        sysUsageCache.users[uuidClean].reqs = 0;
+                        sysUsageCache.users[uuidClean].dReqs = 0;
+                    } else {
+                        sysUsageCache.users[uuidClean] = { reqs: 0, dReqs: 0, lastDay: new Date().toISOString().split('T')[0] };
+                    }
+                    await d1Put(env, "sys_usage", JSON.stringify(sysUsageCache));
+                    const detail = getSubDetail(uuid);
+                    await sendOrEdit(chatId, `✅ ${t("msg_traffic_reset")}\n\n${detail.text}`, detail.kb, messageId);
+                } else if (data.startsWith("sub_extend_init:")) {
+                    const uuid = data.replace("sub_extend_init:", "");
+                    tgState[chatId] = { step: `sub_extend_days:${uuid}` };
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    const text = `📅 ${t("msg_enter_extend_days")}`;
+                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
+                    await sendOrEdit(chatId, text, kb, messageId);
+                } else if (data.startsWith("sub_edit_notes_init:")) {
+                    const uuid = data.replace("sub_edit_notes_init:", "");
+                    tgState[chatId] = { step: `sub_edit_notes:${uuid}` };
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    const text = `📝 ${t("msg_enter_notes")}`;
+                    const kb = { inline_keyboard: [[{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]] };
+                    await sendOrEdit(chatId, text, kb, messageId);
+                } else if (data.startsWith("sub_edit_device_init:")) {
+                    const uuid = data.replace("sub_edit_device_init:", "");
+                    tgState[chatId] = { step: `sub_edit_device:${uuid}` };
+                    await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                    const text = `📱 ${t("msg_enter_device_limit")}`;
+                    const kb = { inline_keyboard: [
+                        [{ text: `♾️ Unlimited`, callback_data: `sub_device_unlimited:${uuid}` }],
+                        [{ text: `❌ ${t("btn_cancel")}`, callback_data: `sub_detail:${uuid}` }]
+                    ] };
+                    await sendOrEdit(chatId, text, kb, messageId);
+                } else if (data.startsWith("sub_device_unlimited:")) {
+                    const uuid = data.replace("sub_device_unlimited:", "");
+                    if (sysConfig.users) {
+                        const u = sysConfig.users.find(usr => usr.id === uuid);
+                        if (u) {
+                            u.maxConfigs = null;
+                            await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                        }
+                    }
+                    const detail = getSubDetail(uuid);
+                    await sendOrEdit(chatId, `✅ ${t("status_updated")}`, detail.kb, messageId);
                 }
                 
                 await fetch(`${tgApi}/answerCallbackQuery`, {
@@ -1440,6 +1855,97 @@ async function handleTelegramWebhook(request, env, hostName, ctx) {
                         
                         const detail = getSubDetail(uuid);
                         await sendOrEdit(chatId, `✅ Limits Updated!`, detail.kb);
+                        return new Response("OK", { status: 200 });
+                    }
+
+                    if (state.step === "sub_search") {
+                        const query = text.toLowerCase();
+                        const users = sysConfig.users || [];
+                        const results = users.filter(u => u.name.toLowerCase().includes(query) || u.id.toLowerCase().includes(query));
+                        tgState[chatId] = null;
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        if (results.length === 0) {
+                            const kb = { inline_keyboard: [[{ text: `🔙 Main Menu`, callback_data: "main_menu" }]] };
+                            await sendOrEdit(chatId, `🔍 No users found for "${text}"`, kb);
+                        } else {
+                            let searchText = `🔍 **Search Results** (${results.length})\n━━━━━━━━━━━━━━━━\n`;
+                            const inline_keyboard = [];
+                            results.slice(0, 10).forEach(u => {
+                                const statusEmoji = u.isPaused ? "⏸️" : (u.expiryMs && Date.now() > u.expiryMs ? "🔴" : "🟢");
+                                searchText += `${statusEmoji} **${u.name}**\n`;
+                                inline_keyboard.push([{ text: `👤 ${u.name}`, callback_data: `sub_detail:${u.id}` }]);
+                            });
+                            inline_keyboard.push([{ text: "🔙 Main Menu", callback_data: "main_menu" }]);
+                            await sendOrEdit(chatId, searchText, { inline_keyboard });
+                        }
+                        return new Response("OK", { status: 200 });
+                    }
+
+                    if (state.step.startsWith("sub_extend_days:")) {
+                        const uuid = state.step.replace("sub_extend_days:", "");
+                        const days = parseInt(text);
+                        if (isNaN(days) || days <= 0) {
+                            await sendOrEdit(chatId, t("msg_invalid"));
+                            return new Response("OK", { status: 200 });
+                        }
+                        if (sysConfig.users) {
+                            const u = sysConfig.users.find(usr => usr.id === uuid);
+                            if (u) {
+                                if (u.expiryMs) {
+                                    u.expiryMs += days * 86400000;
+                                } else {
+                                    u.expiryMs = Date.now() + days * 86400000;
+                                }
+                                if (u.isPaused && u.disabledReason && u.disabledReason.includes('Expiration')) {
+                                    u.isPaused = false;
+                                    u.disabledReason = null;
+                                    u.disabledAt = null;
+                                }
+                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            }
+                        }
+                        tgState[chatId] = null;
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        const detail = getSubDetail(uuid);
+                        const msg = t("msg_expiry_extended").replace("{days}", days);
+                        await sendOrEdit(chatId, `✅ ${msg}\n\n${detail.text}`, detail.kb);
+                        return new Response("OK", { status: 200 });
+                    }
+
+                    if (state.step.startsWith("sub_edit_notes:")) {
+                        const uuid = state.step.replace("sub_edit_notes:", "");
+                        if (sysConfig.users) {
+                            const u = sysConfig.users.find(usr => usr.id === uuid);
+                            if (u) {
+                                u.notes = text;
+                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            }
+                        }
+                        tgState[chatId] = null;
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        const detail = getSubDetail(uuid);
+                        await sendOrEdit(chatId, `✅ Notes updated!`, detail.kb);
+                        return new Response("OK", { status: 200 });
+                    }
+
+                    if (state.step.startsWith("sub_edit_device:")) {
+                        const uuid = state.step.replace("sub_edit_device:", "");
+                        const limit = parseInt(text);
+                        if (isNaN(limit) || limit < 0) {
+                            await sendOrEdit(chatId, t("msg_invalid"));
+                            return new Response("OK", { status: 200 });
+                        }
+                        if (sysConfig.users) {
+                            const u = sysConfig.users.find(usr => usr.id === uuid);
+                            if (u) {
+                                u.maxConfigs = limit > 0 ? limit : null;
+                                await d1Put(env, "sys_config", JSON.stringify(sysConfig));
+                            }
+                        }
+                        tgState[chatId] = null;
+                        await d1Put(env, "tg_bot_state", JSON.stringify(tgState));
+                        const detail = getSubDetail(uuid);
+                        await sendOrEdit(chatId, `✅ Device limit updated!`, detail.kb);
                         return new Response("OK", { status: 200 });
                     }
                 }
@@ -3254,6 +3760,11 @@ function getDashboardUI(hasDB) {
                                   <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_tg_chat">Chat ID</label>
                                   <input type="text" id="cfg-tg-chat" placeholder="123456789" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
                               </div>
+                              <div class="space-y-1 text-start">
+                                  <label class="block text-sm font-bold text-slate-600 dark:text-slate-300 ms-1" data-i18n="lbl_tg_admin">Authorized Telegram Admin ID</label>
+                                  <input type="text" id="cfg-tg-admin" placeholder="123456789" class="w-full px-4 py-3 rounded-xl border border-slate-200 dark:border-darkborder bg-slate-50 dark:bg-slate-800 focus:border-primary outline-none text-sm">
+                                  <p class="text-xs text-slate-400 mt-1" data-i18n="desc_tg_admin">Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.</p>
+                              </div>
                               <p class="text-xs text-slate-400 md:col-span-2" data-i18n="desc_tg_bot">Set these values to receive login alerts via Telegram.</p>
                           </div>
                           
@@ -3597,7 +4108,7 @@ function getDashboardUI(hasDB) {
                   lbl_proto: "Primary Display Mode", lbl_port: "Data Port", lbl_id: "Device UUID (Empty=Auto)",
                   lbl_path: "API Route (Hidden Path)", lbl_pass: "Master Key", lbl_fp: "TLS Signature", lbl_dns: "Resolver IP",
                   lbl_clean_ips: "Clean IPs (Multi-Generator)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "Separate IPs by comma or new line. The Sync URL will multiply configs for all IPs.",
-                  lbl_fake: "Maintenance Hosts (Camouflage)", lbl_relay: "Backup Relay IP", lbl_tfo: "TCP Fast Open", lbl_ech: "Secure Hello (ECH)", lbl_tg_token: "Telegram Bot Token", lbl_tg_chat: "Telegram Chat ID", desc_tg_bot: "Set these values to receive login alerts via Telegram.",
+                  lbl_fake: "Maintenance Hosts (Camouflage)", lbl_relay: "Backup Relay IP", lbl_tfo: "TCP Fast Open", lbl_ech: "Secure Hello (ECH)",                   lbl_tg_token: "Telegram Bot Token", lbl_tg_chat: "Telegram Chat ID", lbl_tg_admin: "Authorized Telegram Admin ID", desc_tg_admin: "Only this Telegram User ID can manage the panel via bot. Leave empty to use Chat ID.", desc_tg_bot: "Set these values to receive login alerts via Telegram.",
                   lbl_cf_acc: "Cloudflare Account ID", lbl_cf_token: "Cloudflare API Token", desc_cf_api: "Optional: Monitor Worker daily usage limit (100k/day). Requires Account Analytics read permission.",
                   lbl_silent: "Silent UI Alerts", lbl_pause: "Kill Switch (Pause System)",
                   lbl_sub_ua: "Custom Subscription User-Agent", desc_sub_ua: "Allow specific browser User-Agent containing this text to bypass camouflage and retrieve profile data directly in web browser.",
@@ -3629,7 +4140,7 @@ function getDashboardUI(hasDB) {
                   lbl_proto: "پروتکل نمایش مستقیم", lbl_port: "پورت داده", lbl_id: "شناسه یکتا (خالی=خودکار)",
                   lbl_path: "مسیر مخفی آی‌پی‌آی", lbl_pass: "کلید اصلی", lbl_fp: "امضای امنیتی", lbl_dns: "آی‌پی تحلیلگر",
                   lbl_clean_ips: "آی‌پی‌های تمیز (مولد چندگانه)", ph_clean_ips: "1.1.1.1, 2.2.2.2", desc_clean_ips: "آی‌پی ها را با کاما یا خط جدید جدا کنید. لینک ساب برای همه ترکیب می‌سازد.",
-                  lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_relay: "آی‌پی جایگزین (کمکی)", lbl_tfo: "اتصال سریع", lbl_ech: "سلام امن", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "شناسه عددی تلگرام", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
+                  lbl_fake: "سایت‌های استتار (حالت مخفی)", lbl_relay: "آی‌پی جایگزین (کمکی)", lbl_tfo: "اتصال سریع", lbl_ech: "سلام امن", lbl_tg_token: "توکن ربات تلگرام", lbl_tg_chat: "شناسه عددی تلگرام", lbl_tg_admin: "شناسه مدیر تلگرام", desc_tg_admin: "فقط این شناسه کاربری تلگرام می‌تواند پنل را از طریق ربات مدیریت کند. خالی بگذارید برای استفاده از شناسه چت.", desc_tg_bot: "با تنظیم این مقادیر، جزئیات ورود به پنل به تلگرام ارسال می‌شود.",
                   lbl_cf_acc: "شناسه اکانت ابری", lbl_cf_token: "توکن دسترسی کاربری", desc_cf_api: "اختیاری: برای نمایش میزان مصرف روزانه کارگر از صد هزار درخواست رایگان در پیام‌های تلگرام.",
                   lbl_silent: "هشدار و پیغام خاموش", lbl_pause: "کلید توقف اضطراری",
                   lbl_sub_ua: "یوزراجنت سفارشی ساب", desc_sub_ua: "درخواست‌های مرورگر که حاوی این متن باشند، استتار را خنثی کرده و مستقیم به ساب دسترسی پیدا می‌کنند.",
@@ -3935,7 +4446,7 @@ function getDashboardUI(hasDB) {
                   apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
                   resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                   enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
-                  tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
+                  tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                   cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
                   isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
                   githubRepo: el('cfg-github-repo').value,
@@ -3974,6 +4485,7 @@ function getDashboardUI(hasDB) {
                       mapId('cfg-relay', conf.backupRelay);
                       mapId('cfg-tg-token', conf.tgToken);
                       mapId('cfg-tg-chat', conf.tgChatId);
+                      mapId('cfg-tg-admin', conf.tgAdminId);
                       mapId('cfg-cf-acc', conf.cfAccountId);
                       mapId('cfg-cf-token', conf.cfApiToken);
                       mapId('cfg-github-repo', conf.githubRepo);
@@ -4086,6 +4598,7 @@ function getDashboardUI(hasDB) {
                       document.getElementById('cfg-ech').checked = conf.enableOpt2 || false;
                       document.getElementById('cfg-tg-token').value = conf.tgToken || '';
                       document.getElementById('cfg-tg-chat').value = conf.tgChatId || '';
+                      document.getElementById('cfg-tg-admin').value = conf.tgAdminId || '';
                       document.getElementById('cfg-cf-acc').value = conf.cfAccountId || '';
                       document.getElementById('cfg-cf-token').value = conf.cfApiToken || '';
                       document.getElementById('cfg-pause').checked = conf.isPaused || false;
@@ -4178,7 +4691,7 @@ function getDashboardUI(hasDB) {
                       apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
                       resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
-                      tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
+                      tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                       cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
                       isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
                       githubRepo: el('cfg-github-repo').value,
@@ -4220,7 +4733,7 @@ function getDashboardUI(hasDB) {
                       apiRoute: el('cfg-path').value, masterKey: el('cfg-pass').value, agent: el('cfg-fp').value,
                       resolveIp: el('cfg-dns').value, customDns: el('cfg-custom-dns').value ? el('cfg-custom-dns').value : 'https://cloudflare-dns.com/dns-query', cleanIps: el('cfg-ips').value, slaveNodes: el('cfg-nodes').value, maintenanceHost: el('cfg-fake').value, backupRelay: el('cfg-relay').value,
                       enableOpt1: el('cfg-tfo').checked, enableOpt2: el('cfg-ech').checked,
-                      tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value,
+                      tgToken: el('cfg-tg-token').value, tgChatId: el('cfg-tg-chat').value, tgAdminId: el('cfg-tg-admin').value,
                       cfAccountId: el('cfg-cf-acc').value, cfApiToken: el('cfg-cf-token').value,
                       isPaused: el('cfg-pause').checked, silentAlerts: el('cfg-silent').checked,
                       githubRepo: el('cfg-github-repo').value,
