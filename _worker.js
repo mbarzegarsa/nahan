@@ -2844,7 +2844,12 @@ function getConfigName(type, profileName, port, hostName, ip) {
         return `${hostName}-${port}${cleanName}`;
     } else if (strategy === "prefix-user-port") {
         return `${prefix}${cleanName}-${port}`;
-    } else { // "default"
+    } 
+    else if (strategy === "ip") {
+    return ip || 'unknown';
+}
+    
+    else { // "default"
         return `${typeLab}-Core-${port}${cleanName}`;
     }
 }
@@ -4474,6 +4479,7 @@ function getDashboardUI(hasDB) {
                                       <option value="user-port">User-Port (e.g. User-443)</option>
                                       <option value="host-port-user">Hostname-Port-User</option>
                                       <option value="prefix-user-port">Custom Prefix-User-Port</option>
+                                      <option value="ip">IP(x.x.x.x)</option>
                                   </select>
                               </div>
                               <div class="space-y-1 text-start">
