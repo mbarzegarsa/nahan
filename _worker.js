@@ -5,7 +5,7 @@ import { connect } from "cloudflare:sockets";
  * Handles real-time binary streams from remote sensor nodes.
  */
 
-const CURRENT_VERSION = "2.9.1";
+const CURRENT_VERSION = "2.9.1-1";
 
 const getAlpha = () => String.fromCharCode(118, 108, 101, 115, 115);
 const getBeta = () => String.fromCharCode(116, 114, 111, 106, 97, 110);
@@ -1766,12 +1766,16 @@ async function handleConfigSync(request, env, ctx) {
             let nodes = nextConfig.slaveNodes.split(/[\r\n,;]+/).map(s=>s.trim()).filter(Boolean);
             let syncKey = nextConfig.syncApiKey || '';
             let currentHost = new URL(request.url).hostname;
+            // Strip master-only secrets so they never leave this panel. Slave nodes keep their
+            // own values (slave merges via { ...sysConfig, ...data.config }, so omitted keys are untouched).
+            let slaveConfig = { ...nextConfig };
+            ['cfAccountId', 'cfApiToken', 'cfWorkerName', 'tgToken', 'tgChatId', 'tgAdminId'].forEach(k => delete slaveConfig[k]);
             nodes.forEach(node => {
                 if(node !== currentHost) {
                      ctx?.waitUntil(fetch(`https://${node}/${encodeURI(nextConfig.apiRoute)}/api/sync`, {
                          method: 'POST',
                          headers: { 'Content-Type': 'application/json' },
-                         body: JSON.stringify({ key: syncKey, config: nextConfig, fromMaster: true })
+                         body: JSON.stringify({ key: syncKey, config: slaveConfig, fromMaster: true })
                      }).catch(() => {}));
                 }
             });
