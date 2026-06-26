@@ -9,7 +9,7 @@ All notable changes to Project Nahan will be documented in this file.
 
 ---
 
-## [2.9.0] - ۱۴۰۵-۰۴-۰۴ (2026-06-26)
+## [2.9.1] - ۱۴۰۵-۰۴-۰۴ (2026-06-26)
 
 <!-- LANG:FA -->
 ### اضافه شده (Added)
